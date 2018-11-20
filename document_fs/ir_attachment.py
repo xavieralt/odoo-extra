@@ -3,55 +3,61 @@ import logging
 import os
 import re
 
-from openerp.osv import osv, fields
+from odoo import api, fields, models
 
 _logger = logging.getLogger(__name__)
 
-class ir_attachment(osv.Model):
+
+class ir_attachment(models.Model):
     _name = "ir.attachment"
     _inherit = 'ir.attachment'
 
+    document_fs_path = fields.Char('Fs path', compute='_get_document_fs_path')
+
     def _document_fs_sanitize(self, name):
-        if isinstance(name, unicode):
-            name = name.encode('utf-8')
-        name = str(name)
-        name = name.replace('/','')
+        if isinstance(name, bytes):
+            try:
+                name = name.decode('utf-8')
+            except UnicodeDecodeError:
+                name = ''
+        name = name.replace('/', '')
         name = re.sub('^[.]+', '', name)
         return name
 
-    def _get_document_fs_path(self, cr, uid, ids, field_name, arg, context=None):
-        r = {}
-        for attachment in self.browse(cr, uid, ids, context=context):
-            link_dir = self._full_path(cr, uid, 'file', 'models')
-            res_model = self._document_fs_sanitize(attachment.res_model)
-            res_id = self._document_fs_sanitize(attachment.res_id)
-            datas_fname = self._document_fs_sanitize(attachment.datas_fname)
-            r[attachment.id] = os.path.join(link_dir, res_model, res_id, datas_fname)
-        return r
+    @api.depends('res_model', 'res_id', 'datas_fname')
+    def _get_document_fs_path(self):
+        for attachment in self:
+            link_dir = os.path.join(self._filestore(), 'file', 'models')
+            res_model = self._document_fs_sanitize(attachment.res_model or '')
+            res_id = self._document_fs_sanitize(str(attachment.res_id))
+            datas_fname = self._document_fs_sanitize(attachment.datas_fname or '')
+            if not (datas_fname and res_model and res_id):
+                attachment.document_fs_path = ''
+                continue
+            link_path = os.path.join(link_dir, res_model, res_id, datas_fname)
+            attachment.document_fs_path = link_path
 
-    _columns = {
-        'document_fs_path': fields.function(_get_document_fs_path, type='char', string='Fs path', readonly=1),
-    }
-
-    def _document_fs_unlink(self, cr, uid, ids, context=None):
-        for attachment in self.browse(cr, uid, ids, context=context):
-            if os.path.isfile(attachment.document_fs_path):
+    def _document_fs_unlink(self):
+        for attachment in self:
+            if os.path.isfile(attachment.document_fs_path or ''):
                 os.unlink(attachment.document_fs_path)
 
-    def _document_fs_link(self, cr, uid, ids, context=None):
-        for attachment in self.browse(cr, uid, ids, context=context):
-            src = self._full_path(cr, uid, 'file', attachment.store_fname)
+    def _document_fs_link(self):
+        for attachment in self:
+            src = self._full_path(attachment.store_fname or '')
             path = attachment.document_fs_path
+            if not src or not path:
+                continue
             link_dir = os.path.dirname(path)
             if not os.path.isdir(link_dir):
                 os.makedirs(link_dir)
             os.link(src, path)
 
-    def _document_fs_sync(self, cr, uid, context=None):
+    def _document_fs_sync(self):
         # WARNING files must be atomically renamed(2) if used in a cron job as
         # we read and unlink them
-        if self._storage(cr, uid, context)== 'file':
-            link_dir = self._full_path(cr, uid, 'file', 'models')
+        if self._storage() == 'file':
+            link_dir = os.path.join(self._filestore(), 'file', 'models')
             l = glob.glob('%s/*/*/*' % link_dir)
             for path in l:
                 if not os.path.isfile(path):
@@ -64,8 +70,11 @@ class ir_attachment(osv.Model):
                 except UnicodeError:
                     continue
                 if res_model in self.pool:
-                    ids = self.search(cr, uid, [('res_model','=',res_model),('res_id','=',res_id),('datas_fname','=',name)])
-                    if ids:
+                    if not self.search([
+                            ('res_model','=',res_model),
+                            ('res_id','=',res_id),
+                            ('datas_fname','=',name)
+                        ]):
                         continue
                     data = open(path).read().encode('base64')
                     os.unlink(path)
@@ -76,24 +85,28 @@ class ir_attachment(osv.Model):
                         'datas_fname': name,
                         'datas': data,
                     }
-                    self.create(cr, uid, attachment)
+                    self.create([attachment])
 
-    def create(self, cr, uid, vals, context=None):
-        attachment_id = super(ir_attachment, self).create(cr, uid, vals, context)
-        if self._storage(cr, uid, context) == 'file':
-            self._document_fs_link(cr, uid, [attachment_id], context=context)
+    @api.model_create_multi
+    def create(self, vals_list):
+        attachments = super(ir_attachment, self).create(vals_list)
+        if self._storage() == 'file':
+            attachments._document_fs_link()
+        return attachments
 
-    def write(self, cr, uid, ids, vals, context=None):
-        if self._storage(cr, uid, context) == 'file':
-            self._document_fs_unlink(cr, uid, ids, context=context)
-        r = super(ir_attachment, self).write(cr, uid, ids, vals, context)
-        if self._storage(cr, uid, context) == 'file':
-            self._document_fs_link(cr, uid, ids, context=context)
+    @api.multi
+    def write(self, vals):
+        if self._storage() == 'file':
+            self._document_fs_unlink()
+        r = super(ir_attachment, self).write(vals)
+        if self._storage() == 'file':
+            self._document_fs_link()
         return r
 
-    def unlink(self, cr, uid, ids, context=None): 
-        if self._storage(cr, uid, context) == 'file':
-            self._document_fs_unlink(cr, uid, ids, context=context)
-        return super(ir_attachment, self).unlink(cr, uid, ids, context)
+    @api.multi
+    def unlink(self):
+        if self._storage() == 'file':
+            self._document_fs_unlink()
+        return super(ir_attachment, self).unlink()
 
 # vim:et:
